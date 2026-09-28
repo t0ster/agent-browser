@@ -1059,7 +1059,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--allow-file-access` | Allow file:// URLs to access local files (Chromium only) |
 | `--hide-scrollbars <bool>` | Hide native scrollbars in headless Chromium screenshots, enabled by default (or `AGENT_BROWSER_HIDE_SCROLLBARS` env) |
 | `-p, --provider <name>` | Browser provider, including configured `browser.provider` plugins (or `AGENT_BROWSER_PROVIDER` env) |
-| `--device <name>` | iOS device name, e.g. "iPhone 15 Pro" (or `AGENT_BROWSER_IOS_DEVICE` env) |
+| `--device <name>` | iOS device name or exact UDID (overrides environment selectors) |
 | `--json` | JSON output (for agents) |
 | `--annotate` | Annotated screenshot with numbered element labels (or `AGENT_BROWSER_ANNOTATE` env) |
 | `--if-changed` | Recommended for repeated captures: skip unchanged images to save tokens (history is per tab and scope) |
@@ -2011,3 +2011,11 @@ When enabled, agent-browser connects to an AgentCore cloud browser session inste
 ## License
 
 Apache-2.0
+
+### Safari and iOS session lifecycle
+
+Safari/iOS reuse the existing WebDriver session for repeated commands with the same provider, resolved device and endpoint. Changing device, Appium port or platform version creates a new session. Explicit `--device` accepts an exact UDID or device name and overrides environment selectors; exact names beat partial matches, ambiguous names fail, and unknown devices and WebDriver errors fail without switching devices or launching Chrome.
+
+`AGENT_BROWSER_APPIUM_PORT` selects the local Appium port (default `4723`). Closing deletes this session, and stops only processes started by the daemon.
+
+WebDriver supports open, get url, eval, snapshot, CSS/ref click and fill, and waits for selectors, text, URL patterns, JavaScript conditions, load or DOMContentLoaded. Snapshots use visible semantic DOM nodes rather than the CDP accessibility tree; cross-frame/shadow-tree expansion, delta snapshots and networkidle waits are unsupported. Refs bind to WebDriver element identities, so DOM reorder cannot retarget them; navigation produces stale-element errors requiring a fresh snapshot. Omitting `--device` retains the selected exact phone even after failed session recreation; deliberate close or provider replacement clears that intent. Cold provider launch has a 10-minute CLI budget plus transport margin and is never retried automatically; Appium keeps ownership of its startup deadlines. MCP tools accept `provider` and `iosDevice` through the same CLI parser; endpoint environment variables apply to the MCP process.

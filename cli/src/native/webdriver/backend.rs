@@ -47,6 +47,45 @@ impl WebDriverBackend {
     pub fn new(client: super::client::WebDriverClient) -> Self {
         Self { client }
     }
+
+    /// Ref actions use the session's element identity, never a CSS re-lookup.
+    pub async fn click_ref(&self, element_id: &str) -> Result<(), String> {
+        self.client.click_element(element_id).await
+    }
+
+    pub async fn fill_ref(&self, element_id: &str, value: &str) -> Result<(), String> {
+        self.client.clear_element(element_id).await?;
+        self.client.send_keys(element_id, value).await
+    }
+
+    pub async fn element_matches(&self, element_id: &str, state: &str) -> Result<bool, String> {
+        let condition = match state {
+            "attached" => "e.isConnected",
+            "detached" => "!e.isConnected",
+            "visible" => "e.isConnected && !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden'",
+            "hidden" => "!e.isConnected || !e.getClientRects().length || getComputedStyle(e).visibility === 'hidden'",
+            _ => return Err(format!("Unsupported selector state {state}")),
+        };
+        let result = self
+            .client
+            .execute_script(
+                &format!("const e = arguments[0]; return {condition};"),
+                vec![serde_json::json!({"element-6066-11e4-a52e-4f735466cecf":element_id})],
+            )
+            .await;
+        match result {
+            Ok(value) => value
+                .as_bool()
+                .ok_or("Invalid WebDriver element-state response".into()),
+            Err(error)
+                if error.starts_with("WebDriver error (stale element reference):")
+                    && matches!(state, "hidden" | "detached") =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[async_trait]

@@ -1023,8 +1023,33 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         }
 
         match send_command_once(&cmd, session) {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                // Close currently acknowledges before the daemon's delayed
+                // shutdown. Wait only here, so the next independent CLI cannot
+                // launch a session in the retiring process and lose it.
+                if cmd["action"].as_str() == Some("close")
+                    && response.success
+                    && response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data["closed"].as_bool())
+                        == Some(true)
+                    && !wait_for_daemon_exit(session, Duration::from_secs(5))
+                {
+                    return Err(
+                        "Browser closed, but daemon shutdown did not finish within 5s".into(),
+                    );
+                }
+                return Ok(response);
+            }
             Err(e) => {
+                // Delivery is uncertain after a transport error. A second
+                // provider launch may create an orphan Appium session.
+                if is_webdriver_launch(&cmd) {
+                    return Err(format!(
+                        "{e} (WebDriver launch not retried; initialization may still be running)"
+                    ));
+                }
                 if is_transient_error(&e) {
                     last_error = e;
                     continue;
@@ -1092,11 +1117,23 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// The env var is deliberately NOT consulted here. Reading it would apply a
 /// long wait budget to every command, so a genuinely hung daemon on a simple
 /// `url`/`title`/`snapshot` call would take the full budget to surface
-/// instead of 30s. Only commands that actually carry a `timeout` field get
-/// the extended budget, and that field is set client-side per invocation,
+/// instead of 30s. Explicit `timeout` fields and cold WebDriver launch
+/// envelopes get extended budgets; timeout is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
+fn is_webdriver_launch(cmd: &Value) -> bool {
+    cmd["action"].as_str() == Some("launch")
+        && cmd["provider"].as_str().is_some_and(|provider| {
+            provider.eq_ignore_ascii_case("ios") || provider.eq_ignore_ascii_case("safari")
+        })
+}
+
 fn read_timeout_for(cmd: &Value) -> Duration {
     let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Cold WDA build/start can exceed the ordinary command timeout. Leave
+    // Appium's create request alive if this outer budget eventually expires.
+    if is_webdriver_launch(cmd) {
+        op_ms = op_ms.max(600_000);
+    }
     if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
@@ -1129,6 +1166,69 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[test]
+    fn webdriver_launch_has_cold_start_budget() {
+        assert_eq!(
+            read_timeout_for(&json!({"action":"launch","provider":"ios"})),
+            Duration::from_secs(610)
+        );
+        assert_eq!(
+            read_timeout_for(&json!({"action":"url"})),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_webdriver_launch_is_sent_once() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let root = tempfile::Builder::new()
+            .prefix("ab-wd-transport-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let env = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        env.set("AGENT_BROWSER_SOCKET_DIR", root.path().to_str().unwrap());
+        env.remove("AGENT_BROWSER_NAMESPACE");
+        let listener = UnixListener::bind(get_socket_path("wd-start")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_count = count.clone();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((socket, _)) = listener.accept() {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(socket).read_line(&mut line).unwrap();
+                    server_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let error = match send_command(
+            json!({"id":"slow","action":"launch","provider":"ios"}),
+            "wd-start",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expected uncertain delivery"),
+        };
+        server.join().unwrap();
+        assert!(error.contains("not retried"), "{error}");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "uncertain delivery must not create another session"
+        );
+    }
 
     #[test]
     fn long_mouse_movement_gets_its_requested_time_budget() {

@@ -1956,6 +1956,11 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         _ => serde_json::Map::new(),
     };
     props.insert(
+        "provider".into(),
+        json!({"type":"string","description":"Browser provider, including ios or safari."}),
+    );
+    props.insert("iosDevice".into(), json!({"type":"string","description":"Explicit iOS device name or exact UDID; passed through the canonical CLI parser."}));
+    props.insert(
         "session".to_string(),
         json!({
             "type": "string",
@@ -3823,6 +3828,14 @@ fn append_common_global_args(
         args.push(namespace);
     }
     append_session_args(args, session);
+    if let Some(provider) = optional_string(arguments, "provider")? {
+        args.push("--provider".into());
+        args.push(provider);
+    }
+    if let Some(device) = optional_string(arguments, "iosDevice")? {
+        args.push("--device".into());
+        args.push(device);
+    }
 
     if let Some(idle_timeout) = optional_string(arguments, "idleTimeout")? {
         args.push("--idle-timeout".to_string());
@@ -4714,6 +4727,25 @@ mod tests {
         let payload: Value = serde_json::from_str(&args[5]).unwrap();
         assert_eq!(payload["siteKey"], "abc");
         assert_eq!(payload["url"], "https://example.com");
+    }
+
+    #[test]
+    fn common_global_args_preserve_ios_provider_and_selector() {
+        let mut args = Vec::new();
+        append_common_global_args(
+            &mut args,
+            &json!({"provider":"ios","iosDevice":"phone-udid"}),
+            None,
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--provider", "ios"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--device", "phone-udid"]));
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.provider.as_deref(), Some("ios"));
+        assert_eq!(flags.device.as_deref(), Some("phone-udid"));
+        assert!(flags.cli_device);
     }
 
     #[test]

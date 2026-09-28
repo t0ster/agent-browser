@@ -3605,6 +3605,7 @@ mod tests {
             no_webmcp: false,
             no_xvfb: false,
             device: None,
+            cli_device: false,
             auto_connect: false,
             pin_tab: false,
             session_name: None,

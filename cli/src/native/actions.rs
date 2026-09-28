@@ -540,6 +540,12 @@ pub struct DaemonState {
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
     pub backend_type: BackendType,
+    // Keep failed provider intent until explicit close/relaunch; never recover to Chrome.
+    webdriver_provider: Option<String>,
+    // Device intent survives expired ownership and failed session recreation.
+    intended_ios_udid: Option<String>,
+    // W3C element IDs become stale across documents and cannot silently retarget.
+    webdriver_refs: HashMap<String, String>,
     pub ref_map: RefMap,
     /// Last delta snapshot per page session. Bounded to the currently tracked tabs.
     snapshot_revisions: HashMap<String, SnapshotRevision>,
@@ -690,6 +696,9 @@ impl DaemonState {
             safari_driver: None,
             webdriver_backend: None,
             backend_type: BackendType::Cdp,
+            webdriver_provider: None,
+            intended_ios_udid: None,
+            webdriver_refs: HashMap::new(),
             ref_map: RefMap::new(),
             snapshot_revisions: HashMap::new(),
             screenshot_observations: HashMap::new(),
@@ -2373,7 +2382,9 @@ fn command_changes_restore_key(cmd: &Value, state: &DaemonState) -> bool {
 }
 
 fn has_active_browser_session(state: &DaemonState) -> bool {
-    state.browser.is_some() || state.active_provider_session.is_some()
+    state.browser.is_some()
+        || state.active_provider_session.is_some()
+        || state.webdriver_backend.is_some()
 }
 
 async fn apply_restore_config_after_confirmation(
@@ -2442,19 +2453,23 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
     let close_result = close_current_browser(state).await;
 
-    if let Some(ref mut webdriver) = state.webdriver_backend {
-        let _ = webdriver.close().await;
+    // Appium and WebDriverBackend reference the same session. Its owning
+    // Appium client deletes it once; the backend is only a command adapter.
+    if let Some(ref mut appium) = state.appium {
+        appium.close().await?;
+    } else if let Some(ref mut webdriver) = state.webdriver_backend {
+        webdriver.close().await?;
     }
     state.webdriver_backend = None;
-    if let Some(ref mut appium) = state.appium {
-        let _ = appium.close().await;
-    }
     state.appium = None;
     if let Some(ref mut driver) = state.safari_driver {
         driver.kill();
     }
     state.safari_driver = None;
     state.backend_type = BackendType::Cdp;
+    state.webdriver_provider = None;
+    state.intended_ios_udid = None;
+    state.webdriver_refs.clear();
 
     close_result
 }
@@ -2708,12 +2723,22 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
+    if !skip_launch && state.webdriver_provider.is_some() && state.webdriver_backend.is_none() {
+        return error_response(
+            &id,
+            "WebDriver session unavailable; explicitly relaunch the selected provider",
+        );
+    }
     let needs_launch = if !skip_launch && !auth_login_no_navigate {
         // Check if existing connection is stale and needs re-launch.
         // This must happen before policy evaluation so plugin capability
         // actions are gated when recovery relaunches would invoke plugins.
         if restore_key_change_needs_launch {
             true
+        } else if state.webdriver_backend.is_some() {
+            // WebDriver owns the active session outside state.browser. Its
+            // command errors must surface instead of falling back to Chrome.
+            false
         } else if let Some(ref mut mgr) = state.browser {
             mgr.has_process_exited() || !mgr.is_connection_alive().await
         } else {
@@ -3911,6 +3936,12 @@ async fn auto_launch(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
+    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+        if provider.eq_ignore_ascii_case("ios") || provider.eq_ignore_ascii_case("safari") {
+            Box::pin(handle_launch(&json!({"provider":provider}), state)).await?;
+            return Ok(());
+        }
+    }
     let mut options = launch_options_from_env();
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
@@ -4710,6 +4741,12 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let provider_name = cmd.get("provider").and_then(|v| v.as_str());
+    // Remember explicit intent before validation: failure must not permit the
+    // next command to auto-select a default simulator or a different backend.
+    state.webdriver_provider = provider_name
+        .filter(|p| p.eq_ignore_ascii_case("ios") || p.eq_ignore_ascii_case("safari"))
+        .map(String::from);
+
     let enable_features =
         string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
     let init_script_paths = string_array_from_command(cmd, "initScripts")
@@ -4877,8 +4914,35 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         };
     }
 
-    let (connection_kind, connection_target) =
+    let (connection_kind, mut connection_target) =
         launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name);
+    // Hash the resolved device, not its selector: aliases for one phone reuse
+    // it, while changing the actual target, endpoint, or OS requires relaunch.
+    // Resolve before teardown so an unknown selector never selects a default.
+    let ios_device = if connection_kind == "provider"
+        && provider_name.is_some_and(|provider| provider.eq_ignore_ascii_case("ios"))
+    {
+        let port = webdriver_port(cmd, "appiumPort", "AGENT_BROWSER_APPIUM_PORT", 4723)?;
+        let (selector, mut udid) = resolve_ios_selectors(cmd);
+        if selector.is_none() && udid.is_none() {
+            // Omission retains the exact active phone; it is not a request to
+            // replace a real device with the default simulator.
+            udid = state.intended_ios_udid.clone();
+        }
+        let device = ios::select_device(selector.as_deref(), udid.as_deref())?;
+        state.intended_ios_udid = Some(device.udid.clone());
+        connection_target =
+            Some(json!(["ios", device.udid, port, cmd.get("platformVersion")]).to_string());
+        Some(device)
+    } else {
+        if connection_kind == "provider"
+            && provider_name.is_some_and(|provider| provider.eq_ignore_ascii_case("safari"))
+        {
+            let port = cmd.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+            connection_target = Some(json!(["safari", port]).to_string());
+        }
+        None
+    };
     let new_hash = launch_hash(
         &launch_options,
         &allowed_domains,
@@ -4893,7 +4957,18 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // Hash comparison and fast process-exit check are evaluated before the
     // async is_connection_alive to skip the expensive CDP liveness probe
     // when a relaunch is already certain.
-    let needs_relaunch = if let Some(ref mut mgr) = state.browser {
+    let reusable_webdriver = state.webdriver_backend.is_some()
+        && state.launch_hash == Some(new_hash)
+        && provider_name.is_some_and(|provider| {
+            provider.eq_ignore_ascii_case("ios") || provider.eq_ignore_ascii_case("safari")
+        });
+    let needs_relaunch = if reusable_webdriver {
+        match state.webdriver_backend.as_ref().unwrap().get_url().await {
+            Ok(_) => false,
+            Err(error) if error.starts_with("WebDriver error (invalid session id):") => true,
+            Err(error) => return Err(error),
+        }
+    } else if let Some(ref mut mgr) = state.browser {
         let is_external =
             launch_connection_is_external(cdp_url, cdp_port, auto_connect, provider_name);
         let was_external = mgr.is_cdp_connection();
@@ -4908,8 +4983,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         true
     };
 
+    let had_webdriver_before_launch = state.webdriver_backend.is_some()
+        || state.appium.is_some()
+        || state.safari_driver.is_some();
     let had_browser_before_launch =
-        state.browser.is_some() || state.active_provider_session.is_some();
+        has_active_browser_session(state) || had_webdriver_before_launch;
 
     if needs_relaunch {
         if local_launch {
@@ -4919,7 +4997,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
         if had_browser_before_launch {
             let _ = auto_save_restore_state(state).await;
-            close_current_browser(state).await?;
+            if had_webdriver_before_launch {
+                close_all_browser_backends(state).await?;
+            } else {
+                close_current_browser(state).await?;
+            }
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
@@ -4927,7 +5009,15 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.invalidate_all_documents();
+    state.webdriver_refs.clear();
     state.session_setup = SessionSetup::default();
+    // Relaunch cleanup releases ownership, not the selected target. Restore
+    // intent before creating a session so a failed creation cannot default a
+    // later omitted-selector retry to a simulator. Other providers clear it.
+    state.intended_ios_udid = ios_device.as_ref().map(|device| device.udid.clone());
+    state.webdriver_provider = provider_name
+        .filter(|p| p.eq_ignore_ascii_case("ios") || p.eq_ignore_ascii_case("safari"))
+        .map(String::from);
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -5010,8 +5100,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(provider) = provider_name {
         match provider.to_lowercase().as_str() {
             "ios" => {
-                let result = launch_ios(cmd, state).await;
+                let result = launch_ios(cmd, state, ios_device).await;
                 if result.is_ok() {
+                    state.launch_hash = Some(new_hash);
                     state.effective_ca_cert = effective_ca_cert;
                 }
                 return result;
@@ -5019,6 +5110,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             "safari" => {
                 let result = launch_safari(cmd, state).await;
                 if result.is_ok() {
+                    state.launch_hash = Some(new_hash);
                     state.effective_ca_cert = effective_ca_cert;
                 }
                 return result;
@@ -5147,7 +5239,7 @@ fn resolve_ios_selectors(cmd: &Value) -> (Option<String>, Option<String>) {
         .map(String::from);
     let command_udid = cmd.get("udid").and_then(|v| v.as_str()).map(String::from);
 
-    if command_udid.is_some() {
+    if cmd.get("deviceNameOrUdid").is_some() || command_udid.is_some() {
         return (command_name_or_udid, command_udid);
     }
 
@@ -5162,12 +5254,48 @@ fn resolve_ios_selectors(cmd: &Value) -> (Option<String>, Option<String>) {
     (env::var("AGENT_BROWSER_IOS_DEVICE").ok(), None)
 }
 
-async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+/// Validate endpoint configuration before any device or driver operation.
+fn webdriver_port(cmd: &Value, field: &str, env_key: &str, default: u16) -> Result<u16, String> {
+    let value = cmd
+        .get(field)
+        .map(|value| match value {
+            Value::String(value) => value.clone(),
+            _ => value.to_string(),
+        })
+        .or_else(|| env::var(env_key).ok());
+    match value {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0 || default == 0)
+            .ok_or_else(|| {
+                format!(
+                    "Invalid {env_key}/{field}: expected {}",
+                    if default == 0 {
+                        "port 0..65535"
+                    } else {
+                        "port 1..65535"
+                    }
+                )
+            }),
+    }
+}
+
+async fn launch_ios(
+    cmd: &Value,
+    state: &mut DaemonState,
+    selected_device: Option<ios::IosDevice>,
+) -> Result<Value, String> {
+    let port = webdriver_port(cmd, "appiumPort", "AGENT_BROWSER_APPIUM_PORT", 4723)?;
     let (name_or_udid, device_udid) = resolve_ios_selectors(cmd);
     let platform_version = cmd.get("platformVersion").and_then(|v| v.as_str());
 
     // Select device (or use default)
-    let device = ios::select_device(name_or_udid.as_deref(), device_udid.as_deref())?;
+    let device = match selected_device {
+        Some(device) => device,
+        None => ios::select_device(name_or_udid.as_deref(), device_udid.as_deref())?,
+    };
 
     // Boot simulator if it's not real and not already booted
     if !device.is_real && device.state != "Booted" {
@@ -5175,7 +5303,7 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     }
 
     // Start Appium
-    let mut appium = AppiumManager::connect_or_launch(Some(&device.udid)).await?;
+    let mut appium = AppiumManager::connect_or_launch(Some(&device.udid), port).await?;
 
     // Create iOS Safari session
     appium
@@ -5184,7 +5312,8 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 
     // Create a WebDriverBackend from the Appium session for common commands
     if let Some(sid) = appium.client.session_id_pub().map(String::from) {
-        let wd_client = super::webdriver::client::WebDriverClient::new_with_session(4723, sid);
+        let wd_client =
+            super::webdriver::client::WebDriverClient::new_with_session(appium.port, sid);
         state.webdriver_backend = Some(WebDriverBackend::new(wd_client));
     }
 
@@ -5206,11 +5335,7 @@ async fn launch_ios(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
 }
 
 async fn launch_safari(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let port: u16 = cmd
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16)
-        .unwrap_or(0);
+    let port = cmd.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
     let driver_port = if port > 0 { port } else { 0 };
 
     // Find a free port if none specified
@@ -5270,6 +5395,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         if state.browser.is_none() {
             state.webmcp.clear_invocations();
             state.ref_map.invalidate_all_documents();
+            state.webdriver_refs.clear();
             wb.navigate(url).await?;
             let new_url = wb.get_url().await.unwrap_or_else(|_| url.to_string());
             let title = wb.get_title().await.unwrap_or_default();
@@ -5506,7 +5632,10 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("script")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'script' parameter")?;
-            let result = wb.evaluate(script).await?;
+            // W3C execute/sync runs a function body; eval returns the JS
+            // completion value for expressions and multi-statement CLI code.
+            let body = format!("return eval({});", serde_json::to_string(script).unwrap());
+            let result = wb.evaluate(&body).await?;
             let url = wb.get_url().await.unwrap_or_default();
             return Ok(json!({ "result": result, "origin": url }));
         }
@@ -5567,6 +5696,58 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if let (Some(wb), None) = (&state.webdriver_backend, &state.browser) {
+        if cmd.get("delta").and_then(Value::as_bool).unwrap_or(false) {
+            return Err("Delta snapshots are not supported on WebDriver".into());
+        }
+        let script = include_str!("webdriver/snapshot.js");
+        let options = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+        let nodes = wb
+            .evaluate(&format!(
+                "return (function(options) {{ {script} }})({options});"
+            ))
+            .await?;
+        let nodes = nodes
+            .as_array()
+            .ok_or("Invalid WebDriver snapshot response")?;
+        let origin = wb.get_url().await?;
+        let removed_refs: Vec<_> = state
+            .ref_map
+            .ref_ids()
+            .into_iter()
+            .map(|id| format!("@{id}"))
+            .collect();
+        state.ref_map.begin_snapshot();
+        state.webdriver_refs.clear();
+        let mut refs = serde_json::Map::new();
+        let mut tree = String::new();
+        for node in nodes {
+            let role = node["role"].as_str().ok_or("Invalid snapshot role")?;
+            let name = node["name"].as_str().ok_or("Invalid snapshot name")?;
+            let selector = node["selector"]
+                .as_str()
+                .ok_or("Invalid snapshot selector")?;
+            let element_id = node["element"]["element-6066-11e4-a52e-4f735466cecf"]
+                .as_str()
+                .ok_or("WebDriver snapshot omitted element identity")?;
+            let reference = format!("e{}", state.ref_map.next_ref_num());
+            state
+                .webdriver_refs
+                .insert(reference.clone(), element_id.into());
+            state
+                .ref_map
+                .set_next_ref_num(state.ref_map.next_ref_num() + 1);
+            state
+                .ref_map
+                .add_selector(reference.clone(), selector.into(), role, name, None);
+            refs.insert(reference.clone(), json!({"role":role,"name":name}));
+            tree.push_str(&format!(
+                "- {role} {} [ref={reference}]\n",
+                serde_json::to_string(name).unwrap()
+            ));
+        }
+        return Ok(json!({"snapshot":tree,"refs":refs,"origin":origin,"removedRefs":removed_refs}));
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -6017,7 +6198,11 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            wb.click(selector).await?;
+            if let Some(element_id) = webdriver_reference(state, selector)? {
+                wb.click_ref(&element_id).await?;
+            } else {
+                wb.click(selector).await?;
+            }
             return Ok(json!({ "clicked": selector }));
         }
     }
@@ -6201,7 +6386,11 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
-            wb.fill(selector, value).await?;
+            if let Some(element_id) = webdriver_reference(state, selector)? {
+                wb.fill_ref(&element_id, value).await?;
+            } else {
+                wb.fill(selector, value).await?;
+            }
             return Ok(json!({ "filled": selector }));
         }
     }
@@ -6444,7 +6633,95 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     Ok(json!({ "unchecked": selector }))
 }
 
+fn webdriver_reference(state: &DaemonState, selector: &str) -> Result<Option<String>, String> {
+    selector
+        .strip_prefix('@')
+        .map(|reference| {
+            state.webdriver_refs.get(reference).cloned().ok_or_else(|| {
+                format!("Unknown or stale reference {selector}; take a new snapshot")
+            })
+        })
+        .transpose()
+}
+
+async fn handle_webdriver_wait(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let wb = state
+        .webdriver_backend
+        .as_ref()
+        .ok_or("WebDriver not launched")?;
+    let timeout = state.timeout_ms(cmd);
+    if let Some(selector) = cmd["selector"].as_str() {
+        if let Some(element_id) = webdriver_reference(state, selector)? {
+            let deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout);
+            loop {
+                if wb
+                    .element_matches(&element_id, cmd["state"].as_str().unwrap_or("visible"))
+                    .await?
+                {
+                    return Ok(json!({"waited":"selector","selector":selector}));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("Wait timed out after {timeout}ms"));
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let expression = if let Some(text) = cmd["text"].as_str() {
+        Some(format!("document.body.innerText.includes({})", json!(text)))
+    } else if let Some(selector) = cmd["selector"].as_str() {
+        let selector = selector.to_string();
+        let condition = match cmd["state"].as_str().unwrap_or("visible") {
+            "attached" => "!!e", "detached" => "!e",
+            "visible" => "!!e && !!(e.getClientRects().length) && getComputedStyle(e).visibility !== 'hidden'",
+            "hidden" => "!e || !e.getClientRects().length || getComputedStyle(e).visibility === 'hidden'",
+            other => return Err(format!("Unsupported selector state {other}")),
+        };
+        Some(format!(
+            "(() => {{ const e=document.querySelector({}); return {condition}; }})()",
+            json!(selector)
+        ))
+    } else if let Some(function) = cmd["function"].as_str() {
+        Some(format!("!!eval({})", json!(function)))
+    } else if let Some(load) = cmd["loadState"].as_str() {
+        Some(match load {
+            "load" => "document.readyState === 'complete'".into(),
+            "domcontentloaded" => "document.readyState !== 'loading'".into(),
+            _ => return Err(format!("Load state {load} is not supported on WebDriver")),
+        })
+    } else {
+        None
+    };
+    if expression.is_none() && cmd["url"].as_str().is_none() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(timeout)).await;
+        return Ok(json!({"waited":"timeout","ms":timeout}));
+    }
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout);
+    loop {
+        // Protocol errors must surface; a dead session must never trigger Chrome fallback.
+        let ready = if let Some(pattern) = cmd["url"].as_str() {
+            route_url_matches(pattern, &wb.get_url().await?)
+        } else {
+            wb.evaluate(&format!("return {};", expression.as_ref().unwrap()))
+                .await?
+                .as_bool()
+                .ok_or("Invalid WebDriver wait response")?
+        };
+        if ready {
+            return Ok(json!({"waited":"condition"}));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Wait timed out after {timeout}ms"));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.webdriver_backend.is_some() && state.browser.is_none() {
+        return handle_webdriver_wait(cmd, state).await;
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
@@ -9565,6 +9842,11 @@ async fn handle_screencast_stop(state: &mut DaemonState) -> Result<Value, String
 // ---------------------------------------------------------------------------
 
 async fn handle_waitforurl(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    if state.webdriver_backend.is_some() && state.browser.is_none() {
+        let mut wait = cmd.clone();
+        wait["url"] = cmd["url"].clone();
+        return handle_webdriver_wait(&wait, state).await;
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let url_pattern = cmd
         .get("url")
@@ -9578,6 +9860,11 @@ async fn handle_waitforurl(cmd: &Value, state: &DaemonState) -> Result<Value, St
 }
 
 async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    if state.webdriver_backend.is_some() && state.browser.is_none() {
+        let mut wait = cmd.clone();
+        wait["loadState"] = cmd["state"].clone();
+        return handle_webdriver_wait(&wait, state).await;
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let load_state = cmd.get("state").and_then(|v| v.as_str()).unwrap_or("load");
@@ -9595,6 +9882,11 @@ async fn handle_waitforloadstate(cmd: &Value, state: &DaemonState) -> Result<Val
 }
 
 async fn handle_waitforfunction(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    if state.webdriver_backend.is_some() && state.browser.is_none() {
+        let mut wait = cmd.clone();
+        wait["function"] = cmd["expression"].clone();
+        return handle_webdriver_wait(&wait, state).await;
+    }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let expression = cmd
@@ -14016,6 +14308,52 @@ mod tests {
         }
 
         let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    }
+
+    #[tokio::test]
+    async fn webdriver_command_pipeline_uses_existing_session() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "AGENT_BROWSER_PROVIDER",
+            "AGENT_BROWSER_PROFILE",
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.set(
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "/nonexistent/webdriver-regression-chrome",
+        );
+        guard.remove("AGENT_BROWSER_PROVIDER");
+        guard.remove("AGENT_BROWSER_PROFILE");
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.path().to_str().unwrap(),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "webdriver-regression");
+        let (port, server) = start_webdriver_response_server(vec![(
+            "/session/phone-session/url",
+            json!({"value": "https://phone.example/"}),
+        )])
+        .await;
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            super::super::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "phone-session".to_string(),
+            ),
+        ));
+        let response = execute_command(&json!({"id": "url", "action": "url"}), &mut state).await;
+        server.abort();
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["data"]["url"], "https://phone.example/");
+        assert!(
+            state.browser.is_none(),
+            "WebDriver commands must never create a CDP browser"
+        );
     }
 
     async fn start_webdriver_response_server(

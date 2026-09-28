@@ -170,10 +170,30 @@ fn select_explicit_device(
     }
 
     if let Some(selector) = name_or_udid {
-        return devices
-            .into_iter()
-            .find(|d| matches_name_or_udid(d, selector))
-            .ok_or_else(|| format!("No iOS device matched selector '{}'", selector));
+        // Exact targets beat fuzzy names, irrespective of inventory ordering.
+        if let Some(device) = devices.iter().find(|d| d.udid == selector) {
+            return Ok(device.clone());
+        }
+        let exact = devices
+            .iter()
+            .filter(|d| d.name.eq_ignore_ascii_case(selector))
+            .collect::<Vec<_>>();
+        let matches = if exact.is_empty() {
+            devices
+                .iter()
+                .filter(|d| matches_name_or_udid(d, selector))
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
+        return match matches.as_slice() {
+            [device] => Ok((*device).clone()),
+            [] => Err(format!("No iOS device matched selector '{}'", selector)),
+            _ => Err(format!(
+                "Ambiguous iOS device selector '{}'; use an exact UDID",
+                selector
+            )),
+        };
     }
 
     Err("No iOS device selector provided".to_string())

@@ -12432,3 +12432,62 @@ async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
     }
     assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
 }
+
+#[tokio::test]
+#[ignore = "requires local Chrome; validates WebDriver DOM script, not an iPhone"]
+async fn e2e_webdriver_snapshot_dom_script() {
+    let root = tempfile::Builder::new()
+        .prefix("ab-wd-dom-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_PROVIDER",
+    ]);
+    env.set("AGENT_BROWSER_SOCKET_DIR", root.path().to_str().unwrap());
+    env.set("AGENT_BROWSER_SESSION", "wd-dom");
+    env.set("AGENT_BROWSER_NAMESPACE", "wd-dom");
+    env.remove("AGENT_BROWSER_PROFILE");
+    env.remove("AGENT_BROWSER_PROVIDER");
+    let mut state = DaemonState::new();
+    let launch = execute_command(
+        &json!({"id":"1","action":"launch","headless":true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&launch);
+    let navigate = execute_command(&json!({"id":"2","action":"navigate","url":"data:text/html,<button aria-label='Continue'>Go</button><div style='display:contents'><textarea placeholder='Composer'></textarea><input placeholder='Search'></div><button hidden>Hidden</button><div style='display:none'><textarea placeholder='Display none'></textarea></div><div hidden><textarea placeholder='Hidden ancestor'></textarea></div><div style='display:contents' aria-hidden='true'><textarea placeholder='ARIA hidden'></textarea></div><div style='display:contents;visibility:hidden'><textarea style='visibility:visible' placeholder='Hidden visibility'></textarea></div>"}), &mut state).await;
+    assert_success(&navigate);
+    let script = format!(
+        "(() => {{ const nodes = (function(options) {{ {} }})({{interactive:true}}); const original = nodes[0].element; const inserted = document.createElement('button'); inserted.textContent = 'Inserted'; document.body.prepend(inserted); original.onclick = () => document.body.dataset.clicked = 'original'; original.click(); return {{clicked:document.body.dataset.clicked, nodes:nodes.map(n => ({{name:n.name,selector:n.selector}}))}}; }})()",
+        include_str!("webdriver/snapshot.js")
+    );
+    let result = execute_command(
+        &json!({"id":"3","action":"evaluate","script":script}),
+        &mut state,
+    )
+    .await;
+    close_current_browser(&mut state).await.unwrap();
+    assert_success(&result);
+    let data = &get_data(&result)["result"];
+    assert_eq!(
+        data["clicked"], "original",
+        "snapshot must retain the original DOM element across reorder"
+    );
+    let nodes = data["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes.len(),
+        3,
+        "visible display:contents descendants must survive, hidden subtrees must not"
+    );
+    assert_eq!(nodes[1]["name"], "Composer");
+    assert_eq!(nodes[2]["name"], "Search");
+    assert_eq!(nodes[0]["name"], "Continue");
+    assert!(nodes[0]["selector"]
+        .as_str()
+        .unwrap()
+        .ends_with("button:nth-child(1)"));
+}

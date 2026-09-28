@@ -397,6 +397,7 @@ pub struct Flags {
     /// launches on displayless Linux hosts.
     pub no_xvfb: bool,
     pub device: Option<String>,
+    pub cli_device: bool,
     pub auto_connect: bool,
     pub pin_tab: bool,
     pub session_name: Option<String>,
@@ -598,6 +599,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             || config.no_webmcp.unwrap_or(false),
         no_xvfb: env_var_is_truthy("AGENT_BROWSER_NO_XVFB"),
         device: env::var("AGENT_BROWSER_IOS_DEVICE").ok().or(config.device),
+        cli_device: false,
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
             || config.auto_connect.unwrap_or(false),
         pin_tab: env_var_is_truthy("AGENT_BROWSER_PIN_TAB") || config.pin_tab.unwrap_or(false),
@@ -946,6 +948,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "--device" => {
                 if let Some(d) = args.get(i + 1) {
                     flags.device = Some(d.clone());
+                    flags.cli_device = true;
                     i += 1;
                 }
             }

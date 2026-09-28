@@ -36,7 +36,12 @@ impl WebDriverClient {
 
     pub async fn delete_session(&mut self) -> Result<(), String> {
         if let Some(ref sid) = self.session_id.clone() {
-            let _ = self.delete(&format!("/session/{}", sid)).await;
+            match self.delete(&format!("/session/{}", sid)).await {
+                Ok(_) => {}
+                // Confirmed absence is already closed, not a deletion refusal.
+                Err(error) if error.starts_with("WebDriver error (invalid session id):") => {}
+                Err(error) => return Err(error),
+            }
             self.session_id = None;
         }
         Ok(())
@@ -55,7 +60,7 @@ impl WebDriverClient {
         Ok(response
             .get("value")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or("Invalid WebDriver string response")?
             .to_string())
     }
 
@@ -65,7 +70,7 @@ impl WebDriverClient {
         Ok(response
             .get("value")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or("Invalid WebDriver string response")?
             .to_string())
     }
 
@@ -76,7 +81,14 @@ impl WebDriverClient {
                 &format!("/session/{}/element", sid),
                 &json!({ "using": using, "value": value }),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if error.starts_with("WebDriver error (no such element):") {
+                    format!("No element found by {} '{}'", using, value)
+                } else {
+                    error
+                }
+            })?;
 
         let element_value = response.get("value").ok_or("No element in response")?;
         element_id_from_value(element_value, using, value)
@@ -129,7 +141,7 @@ impl WebDriverClient {
         Ok(response
             .get("value")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or("Invalid WebDriver string response")?
             .to_string())
     }
 
@@ -145,7 +157,7 @@ impl WebDriverClient {
         Ok(response
             .get("value")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .ok_or("Invalid WebDriver string response")?
             .to_string())
     }
 
@@ -276,6 +288,8 @@ async fn http_request(method: &str, url: &str, body: Option<&Value>) -> Result<V
         .map_err(|e| format!("Write failed: {}", e))?;
 
     let mut response = Vec::new();
+    // Appium owns WDA startup deadlines. Cancelling POST /session here can
+    // abandon a successful session before its ID is known to this daemon.
     stream
         .read_to_end(&mut response)
         .await
@@ -302,17 +316,39 @@ async fn http_request(method: &str, url: &str, body: Option<&Value>) -> Result<V
         body_part.to_string()
     };
 
-    if json_body.is_empty() {
-        return Ok(json!({}));
-    }
-
-    serde_json::from_str(&json_body).map_err(|e| {
+    let status = response_str
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok());
+    let success = status.is_some_and(|status| (200..300).contains(&status));
+    let http_error = || {
         format!(
-            "Invalid JSON response: {} (body: {})",
-            e,
-            json_body.chars().take(100).collect::<String>()
+            "WebDriver HTTP request failed: status {}",
+            status.map_or_else(|| "invalid".into(), |status| status.to_string())
         )
-    })
+    };
+    if json_body.is_empty() {
+        return if success {
+            Ok(json!({}))
+        } else {
+            Err(http_error())
+        };
+    }
+    let payload: Value =
+        serde_json::from_str(&json_body).map_err(|e| format!("Invalid JSON response: {e}"))?;
+    // A successful script may itself return an object with an `error` key.
+    // W3C protocol errors are identified by the HTTP failure status.
+    if !success {
+        if let Some(error) = payload["value"]["error"].as_str() {
+            let message = payload["value"]["message"]
+                .as_str()
+                .unwrap_or("WebDriver request failed");
+            return Err(format!("WebDriver error ({error}): {message}"));
+        }
+        return Err(http_error());
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]

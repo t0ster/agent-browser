@@ -11,17 +11,19 @@ pub struct AppiumManager {
     pub client: WebDriverClient,
     appium_process: Option<Child>,
     pub device_udid: Option<String>,
+    /// Endpoint shared by Appium capabilities and the browser WebDriver client.
+    pub port: u16,
 }
 
 impl AppiumManager {
-    pub async fn connect_or_launch(device_udid: Option<&str>) -> Result<Self, String> {
-        let port = APPIUM_DEFAULT_PORT;
+    pub async fn connect_or_launch(device_udid: Option<&str>, port: u16) -> Result<Self, String> {
         let client = WebDriverClient::new(port);
 
         // Check if Appium is already running
         if is_appium_running(port).await {
             return Ok(Self {
                 client,
+                port,
                 appium_process: None,
                 device_udid: device_udid.map(String::from),
             });
@@ -30,14 +32,15 @@ impl AppiumManager {
         // Try to launch Appium
         let appium_process = launch_appium(port)?;
 
-        // Wait for Appium to be ready
-        wait_for_appium(port, APPIUM_STARTUP_TIMEOUT_SECS).await?;
-
-        Ok(Self {
+        // Own the child before awaiting readiness, so Drop reaps it on failure.
+        let manager = Self {
             client,
+            port,
             appium_process: Some(appium_process),
             device_udid: device_udid.map(String::from),
-        })
+        };
+        wait_for_appium(port, APPIUM_STARTUP_TIMEOUT_SECS).await?;
+        Ok(manager)
     }
 
     pub fn build_ios_capabilities(
@@ -134,7 +137,7 @@ impl AppiumManager {
     }
 
     pub async fn close(&mut self) -> Result<(), String> {
-        let _ = self.client.delete_session().await;
+        self.client.delete_session().await?;
         if let Some(ref mut child) = self.appium_process {
             let _ = child.kill();
             let _ = child.wait();

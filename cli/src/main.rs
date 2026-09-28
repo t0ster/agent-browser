@@ -102,9 +102,13 @@ fn attach_webmcp_launch_option(launch_cmd: &mut serde_json::Value, flags: &Flags
 
 fn attach_ios_device_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
     if flags.provider.as_deref() == Some("ios") {
-        if let Some(ref device) = flags.device {
-            launch_cmd["deviceNameOrUdid"] = json!(device);
-        }
+        // Capture this invocation's selectors; daemon spawn-time env may be stale.
+        launch_cmd["deviceNameOrUdid"] = json!(flags.device);
+        launch_cmd["udid"] = json!(if flags.cli_device {
+            None
+        } else {
+            std::env::var("AGENT_BROWSER_IOS_UDID").ok()
+        });
     }
 }
 
@@ -150,6 +154,12 @@ fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::V
         "provider": provider
     });
     attach_ios_device_to_launch_command(&mut launch_cmd, flags);
+    // Capture client-side endpoint settings; a reused daemon retains its
+    // original environment and must not ignore later CLI configuration.
+    if provider == "ios" {
+        launch_cmd["appiumPort"] =
+            json!(env::var("AGENT_BROWSER_APPIUM_PORT").unwrap_or_else(|_| "4723".into()));
+    }
     launch_cmd["plugins"] = json!(flags.plugins.clone());
     attach_script_launch_options(&mut launch_cmd, flags);
     attach_webmcp_launch_option(&mut launch_cmd, flags);
